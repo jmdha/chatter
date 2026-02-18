@@ -6,5 +6,4 @@ Features:
 
 # todo
  - Allow probuf / ssh connections
- - Allow multiple chat rooms
  - Create client terminal / page

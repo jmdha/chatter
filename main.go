@@ -1,70 +1,85 @@
 package main
 
 import (
-	"sync"
 	"fmt"
 	"time"
+	"sync"
 	"log"
-	"encoding/json"
 	"net/http"
+	"encoding/json"
+	"github.com/google/uuid"
 )
 
 type Message struct {
+	Room    string `json:"room"`
 	User    string `json:"user"`
 	Message string `json:"message"`
 }
 
-var (
-	mu sync.Mutex
-	clients   = make(map[chan Message]bool)
-	broadcast = make(chan Message)
-)
+type Room struct {
+	mu      sync.Mutex
+	clients map[chan Message]bool
+}
+
+var mu     sync.Mutex
+var signal chan Message
+var rooms  map[string]Room
 
 func main() {
-	go handleBroadcast()
+	go broadcast()
 
-	http.HandleFunc("GET /", RouteGetStream)
-	http.HandleFunc("POST /", RoutePostStream)
+	signal = make(chan Message)
+	rooms = make(map[string]Room)
+
+	http.HandleFunc("GET  /api/rooms", API_GetRooms)                       // Retrieve a list of active rooms
+	http.HandleFunc("GET  /api/rooms/{name}/stream", API_GetRoomStream)    // Stream messages sent in room
+	http.HandleFunc("POST /api/rooms", API_PostRoom)                       // Create a room with a random name
+	http.HandleFunc("POST /api/rooms/{name}", API_PostRoomNamed)           // Create a room with name
+	http.HandleFunc("POST /api/rooms/{name}/message", API_PostRoomMessage) // Send message to room
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func handleBroadcast() {
-	for {
-		msg := <-broadcast
-
-		mu.Lock()
-		for client := range clients {
-			select {
-			case client <- msg:
-			default:
-			}
-		}
-		mu.Unlock()
-	}
-}
-
-func RoutePostStream(w http.ResponseWriter, req *http.Request) {
+func broadcast() {
 	var message Message
+	var room    Room
 
-	if err := json.NewDecoder(req.Body).Decode(&message); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	for {
+		message = <- signal
+		room = rooms[message.Room]
+		room.mu.Lock()
+		for client := range room.clients {
+			client <- message
+		}
+		room.mu.Unlock()
 	}
-
-	if message.User == "" || message.Message == "" {
-		http.Error(w, "requires user and message", http.StatusBadRequest)
-		return
-	}
-
-	broadcast <- message
-
-	w.WriteHeader(http.StatusOK)
 }
 
-func RouteGetStream(w http.ResponseWriter, req *http.Request) {
+func API_GetRooms(w http.ResponseWriter, req *http.Request) {
+	var names []string
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	for name, _ := range rooms {
+		names = append(names, name)
+	}
+
+	json.NewEncoder(w).Encode(names)
+}
+
+func API_GetRoomStream(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	name := req.PathValue("name")
+	room, ok := rooms[name]
+
+	if !ok {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -74,15 +89,15 @@ func RouteGetStream(w http.ResponseWriter, req *http.Request) {
 
 	client := make(chan Message)
 
-	mu.Lock()
-	clients[client] = true
-	mu.Unlock()
+	room.mu.Lock()
+	room.clients[client] = true
+	room.mu.Unlock()
 
 	defer func() {
-		mu.Lock()
-		delete(clients, client)
+		room.mu.Lock()
+		delete(room.clients, client)
 		close(client)
-		mu.Unlock()
+		room.mu.Unlock()
 		fmt.Println("client disconnected")
 	}()
 
@@ -101,4 +116,45 @@ func RouteGetStream(w http.ResponseWriter, req *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func API_PostRoom(w http.ResponseWriter, req *http.Request) {
+	var name string
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	name = uuid.New().String()
+
+	rooms[name] = Room {
+		clients : make(map[chan Message]bool),
+	}
+
+	json.NewEncoder(w).Encode(name)
+}
+
+func API_PostRoomNamed(w http.ResponseWriter, req *http.Request) {
+	var name string
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	name = req.PathValue("name")
+
+	rooms[name] = Room {
+		clients : make(map[chan Message]bool),
+	}
+
+	json.NewEncoder(w).Encode(name)
+}
+
+func API_PostRoomMessage(w http.ResponseWriter, req *http.Request) {
+	var message Message
+
+	w.WriteHeader(http.StatusOK)
+
+	_ = json.NewDecoder(req.Body).Decode(&message)
+	message.Room = req.PathValue("name")
+
+	signal <- message
 }
